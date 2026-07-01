@@ -1,0 +1,28 @@
+{
+  "name": "@openchamber/kiro-bridge",
+  "version": "0.1.0",
+  "description": "Protocol bridge presenting kiro-cli (ACP) as an OpenCode HTTP server so OpenChamber can drive Kiro. Never auto-approves tools.",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "kiro-bridge": "./bin/kiro-bridge.mjs"
+  },
+  "scripts": {
+    "start": "node ./bin/kiro-bridge.mjs",
+    "type-check": "tsc --noEmit",
+    "test": "vitest run",
+    "lint": "eslint ."
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "dependencies": {
+    "express": "^5.1.0"
+  },
+  "devDependencies": {
+    "typescript": "~5.9.0",
+    "vitest": "^2.0.0",
+    "@types/node": "^24.3.1",
+    "@types/express": "^5.0.0"
+  }
+}
