@@ -54,12 +54,19 @@ export async function createBridge({ cwd = process.cwd(), agent, logger = consol
     return {};
   };
 
+  // Maps ACP session id -> OpenCode session id (they're identical for sessions we
+  // create directly, but differ for recovered/stale sessions).
+  const acpToOpenCode = new Map();
+
   // ACP notifications -> translator.
   acp.on('notification', (msg) => {
     const { method, params } = msg;
     if (method === 'session/update' || method === '_kiro.dev/session/update') {
-      const sid = params.sessionID || params.sessionId;
-      if (sid) translator.handleSessionUpdate(sid, params.update);
+      const acpSid = params.sessionID || params.sessionId;
+      if (acpSid) {
+        const sid = acpToOpenCode.get(acpSid) || acpSid;
+        translator.handleSessionUpdate(sid, params.update);
+      }
     } else if (method === '_kiro.dev/metadata') {
       // context/token usage — parked for M3 cost readout.
     }
@@ -122,12 +129,15 @@ export async function createBridge({ cwd = process.cwd(), agent, logger = consol
     try {
       const { parentID, title } = req.body || {};
       const result = await acp.request('session/new', { cwd, mcpServers: [] }, { timeoutMs: 30000 });
-      const sessionID = result.sessionId;
+      const acpSessionId = result.sessionId;
       state.setModes(result.modes);
-      const session = state.createSession(sessionID, { title, parentID });
+      // Use the ACP session id as the OpenCode session id too (1:1), so events line up.
+      const session = state.createSession(acpSessionId, { title, parentID });
+      state.setAcpSession(acpSessionId, acpSessionId);
       hub.broadcast({ type: 'session.created', properties: { info: session } }, cwd);
       send(res, session);
     } catch (e) {
+      logger.error?.(`[kiro-bridge] session create failed: ${e.message} ${JSON.stringify(e.data || {})}`);
       res.status(500).json({ error: e.message });
     }
   });
@@ -164,22 +174,92 @@ export async function createBridge({ cwd = process.cwd(), agent, logger = consol
     send(res, withParts);
   });
 
+  // Ensure an ACP session exists for the given OpenCode sessionID. If OpenChamber
+  // restored a session id from its own DB that this bridge run never created,
+  // spin up a fresh ACP session and map it, so prompts don't fail with "Internal error".
+  const ensureAcpSession = async (sessionID) => {
+    let acpId = state.getAcpSession(sessionID);
+    if (acpId) return acpId;
+    const result = await acp.request('session/new', { cwd, mcpServers: [] }, { timeoutMs: 30000 });
+    acpId = result.sessionId;
+    state.setModes(result.modes);
+    if (!state.getSession(sessionID)) {
+      const s = state.createSession(sessionID, {});
+      hub.broadcast({ type: 'session.created', properties: { info: s } }, cwd);
+    }
+    state.setAcpSession(sessionID, acpId);
+    // Map ACP notifications for this new ACP id back to the OpenCode sessionID.
+    acpToOpenCode.set(acpId, sessionID);
+    logger.warn?.(`[kiro-bridge] recovered unknown session ${sessionID} -> new ACP ${acpId}`);
+    return acpId;
+  };
+
   // --- prompt (streamed via SSE; HTTP resolves at end of turn) ---
-  const runPrompt = async (sessionID, parts, { agent: agentOverride } = {}) => {
+  // A single kiro-cli ACP session can only run ONE prompt turn at a time (a second
+  // session/prompt returns "Prompt already in progress"). We therefore serialize
+  // prompts per session: each new prompt chains onto the previous one for that
+  // session so turns never overlap. This also absorbs OpenChamber issuing both
+  // POST /message and prompt_async for a single send (the second simply waits,
+  // and since it carries the same text we skip the empty duplicate).
+  const sessionQueue = new Map(); // sessionID -> Promise (tail of the chain)
+
+  const runPromptInner = async (sessionID, parts, { agent: agentOverride, messageID } = {}) => {
     const text = extractText(parts);
-    state.addUserMessage(sessionID, { agent: agentOverride, text });
+    const acpId = await ensureAcpSession(sessionID);
+    const userInfo = state.addUserMessage(sessionID, { agent: agentOverride, text, id: messageID });
+    translator.emitUserMessage(sessionID, userInfo);
     state.touchSession(sessionID);
     translator.beginTurn(sessionID);
     const promptParts = [{ type: 'text', text }];
-    await acp.request('session/prompt', { sessionId: sessionID, prompt: promptParts }, { timeoutMs: 0 });
-    translator.endTurn(sessionID);
+    logger.info?.(`[kiro-bridge] turn START session=${sessionID} acp=${acpId} text=${JSON.stringify(text.slice(0, 60))}`);
+    // Watchdog: if nothing streams back within 30s, log it (helps spot hung turns).
+    const watchdog = setTimeout(() => {
+      logger.warn?.(`[kiro-bridge] turn for ${sessionID} still running after 30s with no result yet`);
+    }, 30000);
+    try {
+      const result = await acp.request('session/prompt', { sessionId: acpId, prompt: promptParts }, { timeoutMs: 0 });
+      logger.info?.(`[kiro-bridge] turn DONE session=${sessionID} stopReason=${result?.stopReason}`);
+    } catch (e) {
+      logger.error?.(`[kiro-bridge] prompt failed for ${sessionID} (acp ${acpId}): ${e.message} ${JSON.stringify(e.data || {})}`);
+      throw e;
+    } finally {
+      clearTimeout(watchdog);
+      translator.endTurn(sessionID);
+    }
+  };
+
+  const lastPromptKey = new Map(); // sessionID -> dedupe key (messageID or text)
+  const runPrompt = (sessionID, parts, opts = {}) => {
+    const text = extractText(parts);
+    const key = opts.messageID || text;
+    const tail = sessionQueue.get(sessionID) || Promise.resolve();
+
+    // Dedupe: OpenChamber issues the same send via prompt_async (and sometimes
+    // /message). Keyed on the stable client messageID, the duplicate joins the
+    // active turn instead of enqueuing a second prompt.
+    if (sessionQueue.has(sessionID) && lastPromptKey.get(sessionID) === key && key) {
+      logger.warn?.(`[kiro-bridge] duplicate prompt for ${sessionID} (key=${key}); joining active turn`);
+      return tail;
+    }
+
+    lastPromptKey.set(sessionID, key);
+    const next = tail
+      .catch(() => {}) // isolate: a failed prior turn shouldn't cancel the next
+      .then(() => runPromptInner(sessionID, parts, opts));
+    const settled = next.finally(() => {
+      if (sessionQueue.get(sessionID) === settled) {
+        sessionQueue.delete(sessionID);
+        lastPromptKey.delete(sessionID);
+      }
+    });
+    sessionQueue.set(sessionID, settled);
+    return next;
   };
 
   app.post('/session/:id/message', async (req, res) => {
     const sessionID = req.params.id;
-    if (!state.getSession(sessionID)) return res.status(404).json({ error: 'not found' });
     try {
-      await runPrompt(sessionID, req.body?.parts || [], { agent: req.body?.agent });
+      await runPrompt(sessionID, req.body?.parts || [], { agent: req.body?.agent, messageID: req.body?.messageID });
       const msgs = state.messagesWithParts(sessionID);
       const last = msgs[msgs.length - 1];
       send(res, last || {});
@@ -190,9 +270,8 @@ export async function createBridge({ cwd = process.cwd(), agent, logger = consol
 
   app.post('/session/:id/prompt_async', async (req, res) => {
     const sessionID = req.params.id;
-    if (!state.getSession(sessionID)) return res.status(404).json({ error: 'not found' });
     res.status(204).end();
-    runPrompt(sessionID, req.body?.parts || [], { agent: req.body?.agent }).catch((e) =>
+    runPrompt(sessionID, req.body?.parts || [], { agent: req.body?.agent, messageID: req.body?.messageID }).catch((e) =>
       logger.error?.(`[kiro-bridge] async prompt error: ${e.message}`),
     );
   });
@@ -206,17 +285,88 @@ export async function createBridge({ cwd = process.cwd(), agent, logger = consol
   });
 
   // --- permission answer (constraint-critical) ---
-  app.post('/session/:id/permissions/:permissionID', (req, res) => {
-    const response = req.body?.response; // 'once' | 'always' | 'reject'
-    const ok = translator.respondPermission(req.params.permissionID, response);
+  // OpenChamber replies via POST /permission/:permissionID/reply  { response }.
+  // We also accept the legacy /session/:id/permissions/:permissionID path.
+  const handlePermissionReply = (permissionID, response, res) => {
+    const ok = translator.respondPermission(permissionID, response);
     if (!ok) return res.status(404).json({ error: 'unknown permission' });
-    send(res, true);
+    return send(res, true);
+  };
+  app.post('/permission/:permissionID/reply', (req, res) =>
+    handlePermissionReply(req.params.permissionID, req.body?.response, res),
+  );
+  app.post('/session/:id/permissions/:permissionID', (req, res) =>
+    handlePermissionReply(req.params.permissionID, req.body?.response, res),
+  );
+
+  // --- files / search (backed by local FS) ---
+  app.get('/find/file', async (req, res) => {
+    const query = String(req.query.query || req.query.pattern || '').trim();
+    try {
+      const { execFile } = await import('node:child_process');
+      const { promisify } = await import('node:util');
+      const run = promisify(execFile);
+      // Use ripgrep-style listing if available; fall back to find.
+      let files = [];
+      try {
+        const { stdout } = await run('bash', ['-lc', `cd ${shq(cwd)} && (git ls-files 2>/dev/null || find . -type f) | head -2000`]);
+        files = stdout.split('\n').map((s) => s.replace(/^\.\//, '')).filter(Boolean);
+      } catch { files = []; }
+      if (query) {
+        const q = query.toLowerCase();
+        files = files.filter((f) => f.toLowerCase().includes(q));
+      }
+      send(res, files.slice(0, 100));
+    } catch {
+      send(res, []);
+    }
   });
+
+  app.get(['/find', '/find/symbol'], (_req, res) => send(res, []));
+
+  app.get('/file', async (req, res) => {
+    // directory listing
+    const rel = String(req.query.path || '').replace(/^\/+/, '');
+    try {
+      const path = await import('node:path');
+      const fs = await import('node:fs/promises');
+      const abs = path.resolve(cwd, rel);
+      if (!abs.startsWith(cwd)) return res.status(403).json({ error: 'outside workspace' });
+      const entries = await fs.readdir(abs, { withFileTypes: true });
+      send(res, entries.map((e) => ({ name: e.name, type: e.isDirectory() ? 'directory' : 'file' })));
+    } catch {
+      send(res, []);
+    }
+  });
+
+  app.get('/file/content', async (req, res) => {
+    const rel = String(req.query.path || '').replace(/^\/+/, '');
+    try {
+      const path = await import('node:path');
+      const fs = await import('node:fs/promises');
+      const abs = path.resolve(cwd, rel);
+      if (!abs.startsWith(cwd)) return res.status(403).json({ error: 'outside workspace' });
+      const content = await fs.readFile(abs, 'utf8');
+      send(res, { content, type: 'raw' });
+    } catch (e) {
+      res.status(404).json({ error: e.message });
+    }
+  });
+
+  app.get('/file/status', (_req, res) => send(res, []));
+
+  // --- stubs for endpoints OpenChamber polls (return correct empty shapes) ---
+  // Arrays: these are lists the UI iterates over; {} would break it.
+  app.get(['/command', '/mcp', '/lsp', '/skill', '/experimental/session'], (_req, res) => send(res, []));
+  // /vcs -> repo/branch info object (empty is fine)
+  app.get('/vcs', (_req, res) => send(res, {}));
+  // /question -> pending questions (none). /permission -> pending permission requests.
+  app.get('/question', (_req, res) => send(res, []));
+  app.get('/permission', (_req, res) => send(res, translator.allPendingPermissions()));
 
   // --- graceful fallback for unimplemented endpoints ---
   app.all(/.*/, (req, res) => {
     logger.warn?.(`[kiro-bridge] unhandled ${req.method} ${req.path} -> {}`);
-    if (req.method === 'GET') return res.json({});
     return res.json({});
   });
 
@@ -255,8 +405,11 @@ function projectObject(projectID, cwd) {
   return { id: projectID, worktree: cwd, directory: cwd, time: { created: Date.now() } };
 }
 
-function extractText(parts) {
-  if (!Array.isArray(parts)) return '';
+function shq(s) {
+  return `'${String(s).replace(/'/g, `'\\''`)}'`;
+}
+
+function extractText(parts) {  if (!Array.isArray(parts)) return '';
   return parts
     .filter((p) => p && p.type === 'text' && typeof p.text === 'string')
     .map((p) => p.text)

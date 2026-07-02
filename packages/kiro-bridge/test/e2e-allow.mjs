@@ -15,7 +15,7 @@ async function main() {
   const log = (...a) => console.log('[e2e-allow]', ...a);
   const permissions = [];
   const controller = new AbortController();
-  readSse(`${base}/event`, controller.signal, (evt) => { if (evt.type === 'permission.updated') permissions.push(evt.properties); });
+  readSse(`${base}/event`, controller.signal, (evt) => { if (evt.type === 'permission.asked') permissions.push(evt.properties); });
 
   try {
     const session = await (await fetch(`${base}/session`, { method: 'POST', headers: json(), body: '{}' })).json();
@@ -25,7 +25,7 @@ async function main() {
     });
     const permID = await waitFor(() => permissions[0]?.id, 45000);
     if (!permID) throw new Error('no permission prompt');
-    await fetch(`${base}/session/${session.id}/permissions/${permID}`, { method: 'POST', headers: json(), body: JSON.stringify({ response: 'once' }) });
+    await fetch(`${base}/permission/${permID}/reply`, { method: 'POST', headers: json(), body: JSON.stringify({ response: 'once' }) });
     log('permission APPROVED (once)');
     const final = await (await done).json();
     await delay(300);

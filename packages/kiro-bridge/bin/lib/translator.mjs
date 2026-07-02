@@ -45,16 +45,32 @@ export class Translator {
   }
 
   _emitPart(part, delta) {
-    this._emit('message.part.updated', delta ? { part, delta } : { part });
+    const props = delta ? { part, delta } : { part };
+    if (part && part.sessionID) props.sessionID = part.sessionID;
+    this._emit('message.part.updated', props);
   }
 
   _emitMessage(info) {
     this._emit('message.updated', { info });
   }
 
+  // Emit a user message (and its text part) so OpenChamber renders the prompt bubble.
+  emitUserMessage(sessionID, info) {
+    this._emitMessage(info);
+    const partMap = this.state.parts.get(info.id);
+    if (partMap) {
+      for (const part of partMap.values()) this._emitPart(part);
+    }
+    this.state.touchSession(sessionID);
+    this._emit('session.updated', { info: this.state.getSession(sessionID) });
+  }
+
   beginTurn(sessionID) {
     const info = this.state.startAssistantMessage(sessionID, {});
     this.activeAssistant.set(sessionID, info.id);
+    // Server-driven busy so the UI engages its streaming view for this message,
+    // independent of OpenChamber's optimistic (client-side) busy guess.
+    this._emit('session.status', { sessionID, status: { type: 'busy' } });
     this._emitMessage(info);
     this.state.touchSession(sessionID);
     this._emit('session.updated', { info: this.state.getSession(sessionID) });
@@ -68,7 +84,14 @@ export class Translator {
       if (info) this._emitMessage(info);
     }
     this.activeAssistant.delete(sessionID);
-    this._emit('session.idle', { sessionID });
+    // Defer idle by a tick so the client processes the final parts + completed
+    // message (as the still-"busy" streaming message) BEFORE the session flips to
+    // idle. Emitting idle in the same tick as the last parts can race the UI's
+    // streaming-completion logic, leaving the reply unrendered until the next send.
+    setTimeout(() => {
+      this._emit('session.status', { sessionID, status: { type: 'idle' } });
+      this._emit('session.idle', { sessionID });
+    }, 150);
   }
 
   _activeMessageId(sessionID) {
@@ -202,25 +225,37 @@ export class Translator {
     const toolCall = params.toolCall || {};
     const permissionID = `per_${randomUUID()}`;
     const messageID = this._activeMessageId(sessionID);
-
-    // Correlate to a tool part if we have one.
     if (toolCall.toolCallId) this.toolCallToPermission.set(toolCall.toolCallId, permissionID);
 
+    // Build "always" trust patterns from Kiro's _meta.trustOptions when present.
+    const trustOptions = params._meta?.trustOptions || [];
+    const patterns = [];
+    for (const t of trustOptions) {
+      if (Array.isArray(t.patterns)) patterns.push(...t.patterns);
+    }
+
+    // OpenChamber PermissionRequest shape (see ui/src/types/permission.ts).
     const permission = {
       id: permissionID,
-      type: 'tool',
       sessionID,
-      messageID,
-      callID: toolCall.toolCallId,
-      title: toolCall.title || 'Permission required',
-      metadata: { acpOptions: params.options || [], trustOptions: params._meta?.trustOptions || [] },
-      time: { created: now() },
+      permission: toolCall.title || 'Permission required',
+      patterns,
+      metadata: { title: toolCall.title, acpOptions: params.options || [], trustOptions },
+      always: patterns,
+      tool: toolCall.toolCallId ? { messageID, callID: toolCall.toolCallId } : undefined,
     };
-    // Emit OpenCode permission.updated -> OpenChamber shows its permission UI.
-    this._emit('permission.updated', permission);
+
+    // Track for the GET /permission poll (some UI paths fetch rather than rely on SSE).
+    const list = this.state.permissions.get(sessionID) || [];
+    list.push(permission);
+    this.state.permissions.set(sessionID, list);
+
+    // Emit permission.asked -> OpenChamber shows its permission card.
+    this._emit('permission.asked', permission);
 
     return new Promise((resolve) => {
       this.pendingPermissions.set(permissionID, {
+        sessionID,
         resolve: (opencodeResponse) => {
           const optionId = opencodeResponseToAcpOptionId(opencodeResponse);
           resolve({ outcome: { outcome: 'selected', optionId } });
@@ -229,14 +264,27 @@ export class Translator {
     });
   }
 
-  // Called by the HTTP route POST /session/:id/permissions/:permissionID
-  // body: { response: 'once'|'always'|'reject' }
+  // Pending permissions for a session (for GET /permission).
+  pendingPermissionList(sessionID) {
+    return this.state.permissions.get(sessionID) || [];
+  }
+
+  allPendingPermissions() {
+    const out = [];
+    for (const list of this.state.permissions.values()) out.push(...list);
+    return out;
+  }
+
+  // Called by POST /permission/:permissionID/reply  body: { response: 'once'|'always'|'reject' }
   respondPermission(permissionID, response) {
     const pending = this.pendingPermissions.get(permissionID);
     if (!pending) return false;
     this.pendingPermissions.delete(permissionID);
+    // Remove from the per-session pending list.
+    const list = this.state.permissions.get(pending.sessionID) || [];
+    this.state.permissions.set(pending.sessionID, list.filter((p) => p.id !== permissionID));
     pending.resolve(response || 'reject');
-    this._emit('permission.replied', { permissionID, response: response || 'reject' });
+    this._emit('permission.replied', { sessionID: pending.sessionID, requestID: permissionID, response: response || 'reject' });
     return true;
   }
 }

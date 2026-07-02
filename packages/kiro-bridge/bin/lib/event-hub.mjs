@@ -14,12 +14,17 @@ export class EventHub {
   }
 
   addClient(res, { directory } = {}) {
+    // Disable Nagle so small SSE frames aren't coalesced/held.
+    try { res.socket?.setNoDelay?.(true); } catch { /* ignore */ }
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache, no-transform',
       Connection: 'keep-alive',
       'X-Accel-Buffering': 'no',
+      'Content-Encoding': 'identity', // defeat compression middleware buffering
     });
+    // Flush headers immediately so the client opens the stream without waiting.
+    if (typeof res.flushHeaders === 'function') res.flushHeaders();
     // First event MUST be server.connected so OpenChamber marks the server live.
     this._writeTo(res, { type: 'server.connected', properties: {} }, directory);
     this.clients.add(res);
@@ -33,9 +38,17 @@ export class EventHub {
     return `id: ${id}\ndata: ${JSON.stringify(envelope)}\n\n`;
   }
 
+  _flush(res) {
+    // Express-compression (and some proxies) expose res.flush(); call it if present.
+    if (typeof res.flush === 'function') {
+      try { res.flush(); } catch { /* ignore */ }
+    }
+  }
+
   _writeTo(res, payload, directory) {
     try {
       res.write(this._frame(payload, directory));
+      this._flush(res);
     } catch {
       this.clients.delete(res);
     }
@@ -50,6 +63,7 @@ export class EventHub {
     for (const res of this.clients) {
       try {
         res.write(`: ping ${Date.now()}\n\n`);
+        this._flush(res);
       } catch {
         this.clients.delete(res);
       }

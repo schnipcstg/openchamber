@@ -18,6 +18,15 @@ export class BridgeState {
     this.parts = new Map(); // messageID -> Map(partID -> Part)
     this.modes = { currentModeId: null, availableModes: [] };
     this.permissions = new Map(); // permissionID -> { resolve, meta }
+    this.acpBySession = new Map(); // openCode sessionID -> ACP sessionId
+  }
+
+  setAcpSession(sessionID, acpSessionId) {
+    this.acpBySession.set(sessionID, acpSessionId);
+  }
+
+  getAcpSession(sessionID) {
+    return this.acpBySession.get(sessionID) || null;
   }
 
   setModes(modes) {
@@ -73,8 +82,8 @@ export class BridgeState {
     this.messages.delete(sessionID);
   }
 
-  addUserMessage(sessionID, { agent, text }) {
-    const id = `msg_${randomUUID()}`;
+  addUserMessage(sessionID, { agent, text, id: providedId }) {
+    const id = providedId || `msg_${randomUUID()}`;
     const info = {
       id,
       sessionID,

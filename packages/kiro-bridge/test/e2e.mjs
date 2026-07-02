@@ -3,7 +3,7 @@
 //   1. /global/health is healthy
 //   2. server.connected arrives first on SSE
 //   3. session.created + message.part.updated (text) stream in
-//   4. permission.updated fires for the tool call; we answer 'reject' via HTTP
+//   4. permission.asked fires for the tool call; we answer 'reject' via HTTP
 //      and confirm the command did NOT run (no auto-approval).
 import { createBridge } from '../bin/lib/server.mjs';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -34,7 +34,7 @@ async function main() {
     const controller = new AbortController();
     const ssePromise = readSse(`${base}/event`, controller.signal, (evt) => {
       events.push(evt.type);
-      if (evt.type === 'permission.updated') permissions.push(evt.properties);
+      if (evt.type === 'permission.asked') permissions.push(evt.properties);
     });
     await delay(300);
     assert(events[0] === 'server.connected', `first event server.connected (got ${events[0]})`);
@@ -53,11 +53,11 @@ async function main() {
 
     // wait for a permission prompt
     const permID = await waitFor(() => permissions[0]?.id, 45000);
-    assert(permID, 'permission.updated fired');
+    assert(permID, 'permission.asked fired');
     log('permission prompt received:', permID, JSON.stringify(permissions[0].title));
 
     // answer REJECT
-    const rej = await fetch(`${base}/session/${session.id}/permissions/${permID}`, {
+    const rej = await fetch(`${base}/permission/${permID}/reply`, {
       method: 'POST', headers: json(), body: JSON.stringify({ response: 'reject' }),
     });
     assert(rej.ok, 'permission reject accepted');

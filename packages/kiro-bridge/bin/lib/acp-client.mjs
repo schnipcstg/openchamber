@@ -95,8 +95,10 @@ export class AcpClient extends EventEmitter {
     if (msg.id !== undefined && (msg.result !== undefined || msg.error !== undefined) && this.pending.has(msg.id)) {
       const { resolve, reject } = this.pending.get(msg.id);
       this.pending.delete(msg.id);
-      if (msg.error) reject(Object.assign(new Error(msg.error.message || 'ACP error'), { data: msg.error }));
-      else resolve(msg.result);
+      if (msg.error) {
+        this.logger.error?.(`[kiro-bridge] ACP error response: ${JSON.stringify(msg.error)}`);
+        reject(Object.assign(new Error(msg.error.message || 'ACP error'), { data: msg.error }));
+      } else resolve(msg.result);
       return;
     }
     // Client-bound REQUEST (has method AND id) -> we must respond
