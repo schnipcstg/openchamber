@@ -367,7 +367,7 @@ const ChatViewport = React.memo(({
                                     <QuestionCard key={question.id} question={question} />
                                 ))}
                                 {sessionPermissions.map((permission) => (
-                                    <PermissionCard key={permission.id} permission={permission} />
+                                    <PermissionCard key={permission.id} permission={permission} directory={directory} />
                                 ))}
                             </div>
                         )}

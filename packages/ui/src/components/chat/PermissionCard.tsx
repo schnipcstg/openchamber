@@ -2,14 +2,15 @@ import React from 'react';
 import { cn } from '@/lib/utils';
 import type { PermissionRequest, PermissionResponse } from '@/types/permission';
 import { useSessionUIStore } from '@/sync/session-ui-store';
-import { useSessions } from '@/sync/sync-context';
+import { useSessionParts, useSessions } from '@/sync/sync-context';
 import * as sessionActions from '@/sync/session-actions';
 import { WorkerHighlightedCode } from '@/components/code/WorkerHighlightedCode';
 import { ScrollableOverlay } from '@/components/ui/ScrollableOverlay';
 import { Icon } from "@/components/icon/Icon";
 import { DiffPreview, WritePreview } from './DiffPreview';
 import { useI18n } from '@/lib/i18n';
-import { getVisiblePermissionPatterns } from './permissionCardPatterns';
+import { getVisibleAlwaysPatterns, getVisiblePermissionPatterns } from './permissionCardPatterns';
+import { getPermissionToolInput } from './permissionCardToolInput';
 
 const PERMISSION_BASH_CUSTOM_STYLE: React.CSSProperties = {
   margin: 0,
@@ -43,6 +44,7 @@ const PERMISSION_JSON_CUSTOM_STYLE: React.CSSProperties = {
 
 interface PermissionCardProps {
   permission: PermissionRequest;
+  directory?: string;
   onResponse?: (response: 'once' | 'always' | 'reject') => void;
 }
 
@@ -90,6 +92,7 @@ const getToolDisplayName = (toolName: string): string => {
 
 export const PermissionCard: React.FC<PermissionCardProps> = ({
   permission,
+  directory,
   onResponse
 }) => {
   const { t } = useI18n();
@@ -98,6 +101,11 @@ export const PermissionCard: React.FC<PermissionCardProps> = ({
   const respondToPermission = sessionActions.respondToPermission;
   const sessions = useSessions();
   const currentSessionId = useSessionUIStore((state) => state.currentSessionId);
+  const toolParts = useSessionParts(permission.tool?.messageID ?? '', directory);
+  const toolInput = React.useMemo(
+    () => getPermissionToolInput(toolParts, permission.tool?.callID),
+    [toolParts, permission.tool?.callID],
+  );
   const isFromSubagent = React.useMemo(() => {
     if (!currentSessionId || permission.sessionID === currentSessionId) return false;
     const sourceSession = sessions.find((session) => session.id === permission.sessionID);
@@ -280,6 +288,10 @@ export const PermissionCard: React.FC<PermissionCardProps> = ({
 
     const genericContent = getMeta('command') || getMeta('content') || getMeta('action') || getMeta('operation');
     const description = getMeta('description');
+    const hasMetadata = Object.keys(permission.metadata).length > 0;
+    // MCP tools ask with empty metadata, so fall back to the resolved tool input
+    // for the same call. Scoped to the case where the request carries nothing.
+    const fallbackInput = !genericContent && !description && !hasMetadata ? toolInput : undefined;
 
     return (
       <>
@@ -297,13 +309,26 @@ export const PermissionCard: React.FC<PermissionCardProps> = ({
           </div>
         )}
         {}
-        {Object.keys(permission.metadata).length > 0 && !genericContent && !description && (
+        {hasMetadata && !genericContent && !description && (
           <div>
             <div className="typography-meta text-muted-foreground mb-1">{t('chat.permissionCard.details')}</div>
             <ScrollableOverlay outerClassName="max-h-32" className="p-0">
               <pre className="typography-meta font-mono px-2 py-1 bg-muted/30 rounded whitespace-pre-wrap break-all">
                 {JSON.stringify(permission.metadata, null, 2)}
               </pre>
+            </ScrollableOverlay>
+          </div>
+        )}
+        {fallbackInput && (
+          <div>
+            <div className="typography-meta text-muted-foreground mb-1">{t('chat.permissionCard.details')}</div>
+            <ScrollableOverlay outerClassName="max-h-48" className="p-0">
+              <WorkerHighlightedCode
+                language="json"
+                code={JSON.stringify(fallbackInput, null, 2)}
+                style={PERMISSION_JSON_CUSTOM_STYLE}
+                wrap
+              />
             </ScrollableOverlay>
           </div>
         )}
@@ -395,7 +420,9 @@ export const PermissionCard: React.FC<PermissionCardProps> = ({
               >
                 <Icon name="time" className="h-3.5 w-3.5 sm:h-3 sm:w-3 flex-shrink-0" />
                 {(() => {
-                  const always = (permission.always as string[]) || (permission.metadata.always as string[]) || [];
+                  const always = getVisibleAlwaysPatterns(
+                    (permission.always as string[]) || (permission.metadata.always as string[]) || [],
+                  );
                   if (always.length === 0) return "Always Allow";
                   const displayPatterns = always.slice(0, 2);
                   const text = displayPatterns.join(", ");
